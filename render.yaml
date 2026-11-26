@@ -16,6 +16,9 @@ projects:
                 value: s3
               - key: S3_PREFIX
                 value: workspaces/
+              # The bucket's region. us-west-2 is Oregon, next to these services.
+              - key: S3_REGION
+                value: us-west-2
               - key: DEFAULT_MONTHLY_AI_CAP_USD
                 value: "5"
               - key: SCAN_INTERVAL_HOURS
