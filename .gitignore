@@ -316,3 +316,7 @@ web/out/
 # Regenerate with `npm run harvest:buildlist`.
 buildlist-*.yml
 buildlist-*.yml.progress.json
+# JobFlow layer (jobflow/): its own dependencies
+jobflow/node_modules/
+# Fork-owned paths declaration, committed so CI and the updater see it (see config/local-paths.example.txt)
+!config/local-paths.txt

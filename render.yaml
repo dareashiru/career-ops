@@ -1,0 +1,164 @@
+# JobFlow on Render (phase 1 private beta). See jobflow/README.md.
+#
+# No persistent disks: every user's files live in an S3/R2 bucket, so each
+# service can run several instances. Values marked sync: false are secrets you
+# enter in the Render dashboard when you first apply this Blueprint.
+projects:
+  - name: jobflow
+    environments:
+      - name: production
+        envVarGroups:
+          - name: jobflow-shared
+            envVars:
+              - key: JOBFLOW_INTERNAL_TOKEN
+                generateValue: true
+              - key: STORAGE_DRIVER
+                value: s3
+              - key: S3_PREFIX
+                value: workspaces/
+              - key: DEFAULT_MONTHLY_AI_CAP_USD
+                value: "5"
+              - key: SCAN_INTERVAL_HOURS
+                value: "8"
+
+        databases:
+          - name: jobflow-db
+            plan: basic-256mb
+            region: oregon
+            postgresMajorVersion: "16"
+
+        services:
+          # The only public service: sign-in, JobFlow pages, and the proxy to each user's app.
+          - type: web
+            name: jobflow-app
+            runtime: docker
+            region: oregon
+            plan: starter
+            dockerfilePath: ./jobflow/Dockerfile
+            dockerContext: .
+            dockerCommand: node jobflow/src/main.mjs app
+            healthCheckPath: /jobflow/health
+            envVars:
+              - fromGroup: jobflow-shared
+              - key: DATABASE_URL
+                fromDatabase:
+                  name: jobflow-db
+                  property: connectionString
+              - key: WEBHOST_URL
+                fromService:
+                  name: jobflow-webhost
+                  type: pserv
+                  property: hostport
+              - key: PUBLIC_URL
+                sync: false
+              - key: S3_BUCKET
+                sync: false
+              - key: S3_ENDPOINT
+                sync: false
+              - key: S3_ACCESS_KEY_ID
+                sync: false
+              - key: S3_SECRET_ACCESS_KEY
+                sync: false
+              - key: JOBFLOW_ENCRYPTION_KEY
+                sync: false
+              - key: ADMIN_EMAILS
+                sync: false
+              - key: GOOGLE_CLIENT_ID
+                sync: false
+              - key: GOOGLE_CLIENT_SECRET
+                sync: false
+
+          # Runs each signed-in user's own upstream career-ops web app.
+          - type: pserv
+            name: jobflow-webhost
+            runtime: docker
+            region: oregon
+            plan: standard
+            dockerfilePath: ./jobflow/Dockerfile
+            dockerContext: .
+            dockerCommand: node jobflow/src/main.mjs webhost
+            maxShutdownDelaySeconds: 120
+            envVars:
+              - fromGroup: jobflow-shared
+              - key: PORT
+                value: "10000"
+              - key: MAX_WEB_SESSIONS
+                value: "6"
+              - key: DATABASE_URL
+                fromDatabase:
+                  name: jobflow-db
+                  property: connectionString
+              - key: S3_BUCKET
+                sync: false
+              - key: S3_ENDPOINT
+                sync: false
+              - key: S3_ACCESS_KEY_ID
+                sync: false
+              - key: S3_SECRET_ACCESS_KEY
+                sync: false
+              - key: JOBFLOW_ENCRYPTION_KEY
+                sync: false
+              - key: AI_BASE_URL
+                sync: false
+              - key: AI_API_KEY
+                sync: false
+              - key: AI_MODEL
+                sync: false
+              - key: AI_PRICE_INPUT_PER_MTOK
+                sync: false
+              - key: AI_PRICE_OUTPUT_PER_MTOK
+                sync: false
+
+          # Runs scan and score jobs for users whose web app is not open.
+          - type: worker
+            name: jobflow-worker
+            runtime: docker
+            region: oregon
+            plan: starter
+            dockerfilePath: ./jobflow/Dockerfile
+            dockerContext: .
+            dockerCommand: node jobflow/src/main.mjs worker
+            maxShutdownDelaySeconds: 300
+            envVars:
+              - fromGroup: jobflow-shared
+              - key: DATABASE_URL
+                fromDatabase:
+                  name: jobflow-db
+                  property: connectionString
+              - key: S3_BUCKET
+                sync: false
+              - key: S3_ENDPOINT
+                sync: false
+              - key: S3_ACCESS_KEY_ID
+                sync: false
+              - key: S3_SECRET_ACCESS_KEY
+                sync: false
+              - key: JOBFLOW_ENCRYPTION_KEY
+                sync: false
+              - key: AI_BASE_URL
+                sync: false
+              - key: AI_API_KEY
+                sync: false
+              - key: AI_MODEL
+                sync: false
+              - key: AI_PRICE_INPUT_PER_MTOK
+                sync: false
+              - key: AI_PRICE_OUTPUT_PER_MTOK
+                sync: false
+
+          # Hourly: queue a scan for each user whose last scan is older than SCAN_INTERVAL_HOURS.
+          - type: cron
+            name: jobflow-scan-schedule
+            runtime: docker
+            region: oregon
+            plan: starter
+            schedule: "0 * * * *"
+            dockerfilePath: ./jobflow/Dockerfile
+            dockerContext: .
+            dockerCommand: node jobflow/src/main.mjs cron
+            envVars:
+              - fromGroup: jobflow-shared
+              - key: DATABASE_URL
+                fromDatabase:
+                  name: jobflow-db
+                  property: connectionString
