@@ -1,0 +1,4 @@
+# Files this fork owns that upstream career-ops does not ship (JobFlow).
+# update-system.mjs never writes to these, and the coverage guard skips them.
+jobflow/
+render.yaml
