@@ -10,7 +10,7 @@
   "scripts": {
     "start": "node src/main.mjs",
     "migrate": "node src/main.mjs migrate",
-    "test": "node --test --test-concurrency=1 test/*.test.mjs"
+    "test": "node --test --test-concurrency=1 test/*.spec.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1178.0",

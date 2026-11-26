@@ -96,6 +96,8 @@
           - package.json
           - dashboard/go.mod
           - dashboard/go.sum
+          - jobflow/package.json
+          - jobflow/package-lock.json
           - scaffolder/package.json
           - web/package.json
           - web/package-lock.json

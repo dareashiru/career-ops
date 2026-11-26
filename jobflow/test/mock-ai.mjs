@@ -54,6 +54,3 @@ export function startMockAi({ stream = false } = {}) {
   });
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
-  startMockAi().then((m) => console.log(m.url));
-}

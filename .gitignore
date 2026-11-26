@@ -320,3 +320,4 @@ buildlist-*.yml.progress.json
 jobflow/node_modules/
 # Fork-owned paths declaration, committed so CI and the updater see it (see config/local-paths.example.txt)
 !config/local-paths.txt
+!jobflow/package-lock.json

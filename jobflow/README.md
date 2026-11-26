@@ -88,9 +88,9 @@ cd jobflow && npm test
 
 Database tests use `TEST_DATABASE_URL` (default
 `postgres://jobflow:jobflow@127.0.0.1/jobflow_test`; the database is wiped) and
-are skipped without one. `test/isolation.test.mjs` is the gate-1 check from the
+are skipped without one. `test/isolation.spec.mjs` is the gate-1 check from the
 plan: two users, a stand-in web app, and the ways one might try to read the
-other's files. Run it as root to cover the per-uid sandbox. `test/score.test.mjs`
+other's files. Run it as root to cover the per-uid sandbox. `test/score.spec.mjs`
 scores a job end to end through the real career-ops scripts and a mock AI.
 
 ## Deploy on Render
