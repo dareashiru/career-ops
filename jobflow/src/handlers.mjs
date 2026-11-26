@@ -18,7 +18,6 @@ export async function runScan(ctx, job, ws) {
     dataDir: ws.dir, uid: ws.uid,
     timeoutMs: config.jobTimeoutMinutes * 60_000,
   });
-  await pool.query('UPDATE users SET last_scan_at = now() WHERE id = $1', [job.user_id]);
   const log = `$ node scan.mjs --quiet (exit ${res.code})\n${tail(res.stdout)}\n${tail(res.stderr, 2000)}`;
   if (res.code !== 0 && /portals\.yml not found/.test(res.stdout + res.stderr)) {
     return { ok: false, message: 'Add the companies you want to watch first (Portals, in career-ops), then scan again.', log };
@@ -26,6 +25,8 @@ export async function runScan(ctx, job, ws) {
   if (res.code !== 0) {
     return { ok: false, message: res.timedOut ? 'The scan took too long and was stopped.' : 'The scan did not finish. See the log.', log };
   }
+  // Only a finished scan counts, so a failed one is retried at the next scheduled run.
+  await pool.query('UPDATE users SET last_scan_at = now() WHERE id = $1', [job.user_id]);
   const summary = res.stdout.trim().split('\n').filter(Boolean).slice(-6).join('\n');
   return { ok: true, message: 'Scan finished.', result: { summary }, log };
 }
@@ -37,17 +38,74 @@ export function parseEvalOutput(stdout) {
   return { score: score ? Number(score[1]) : null, report: report ? report[1] : null };
 }
 
+/**
+ * Decide which link a job is scored under, following upstream's "Aggregator
+ * Listings -- Confirm at the Employer" rule through its confirm-at-employer.mjs.
+ * Returns {url} (the employer's link, canonical from here on) or {fail} with
+ * the outcome to show. A job-board page is never fetched: the JD comes from
+ * the employer's link or from the text the user pasted.
+ */
+export async function confirmEmployerUrl(ctx, ws, { url, company, title, tmp, logs }) {
+  const input = join(tmp, 'posting.json');
+  await writeFile(input, JSON.stringify({ url, company, title }), 'utf8');
+  await ws.own(tmp);
+  const run = await runScript(ctx.config.careerOpsDir, 'confirm-at-employer.mjs', ['--input', input, '--json'], {
+    dataDir: ws.dir, uid: ws.uid, timeoutMs: 120_000,
+  });
+  logs.push(`$ node confirm-at-employer.mjs (exit ${run.code})\n${tail(run.stdout, 1500)}`);
+  return interpretConfirmation(run, { company });
+}
+
+const BOARD_LINK_HELP = 'Job boards like LinkedIn keep listings up after a role is filled, so JobFlow scores only roles it can find on the employer\'s own site.';
+
+export function interpretConfirmation(run, { company }) {
+  let r = null;
+  try { r = run.code === 0 ? JSON.parse(run.stdout) : null; } catch { r = null; }
+  if (!r?.verdict) {
+    return { fail: { ok: false, message: "Couldn't check that link. Try again later, or paste the job description without the link." } };
+  }
+  const closed = (employerUrl) => ({ fail: { ok: false, message: 'That posting looks closed.', result: { closed: true, url: employerUrl, evidence: r.evidence } } });
+  if (r.verdict === 'employer_url') return r.live === 'closed' ? closed(r.employerUrl) : { url: r.employerUrl };
+  if (r.verdict === 'found' && (r.match === 'origin' || r.match === 'exact')) {
+    return r.live === 'closed' ? closed(r.employerUrl) : { url: r.employerUrl, confirmed: r.match };
+  }
+  if (r.verdict === 'found') {
+    return { fail: { ok: false, message: `A similar role is on the employer's site: ${r.employerUrl}. If it is the same job, score that link.`, result: { candidate: r.employerUrl } } };
+  }
+  if (r.verdict === 'unidentified') {
+    return { fail: { ok: false, message: `That link is from a job board. Give the employer's own link for this role, or add the company and job title so JobFlow can look for it. ${BOARD_LINK_HELP}` } };
+  }
+  const near = (r.near || []).slice(0, 3).map((n) => `${n.title}: ${n.url}`);
+  return {
+    fail: {
+      ok: false,
+      message: `Couldn't find this role on ${company || 'the employer'}'s own job site. If you have the employer's link, score that instead. ${BOARD_LINK_HELP}`,
+      result: near.length ? { near } : undefined,
+    },
+  };
+}
+
 export async function runScore(ctx, job, ws, user) {
   const { config, pool } = ctx;
-  const url = typeof job.payload.url === 'string' ? job.payload.url.trim() : '';
+  const str = (v) => (typeof v === 'string' ? v.trim() : '');
+  let url = str(job.payload.url);
+  const company = str(job.payload.company);
+  const title = str(job.payload.title);
   let text = typeof job.payload.text === 'string' ? job.payload.text : '';
   const logs = [];
   const tmp = join(ws.dir, '.jobflow-tmp', `job-${job.id}`);
   await mkdir(tmp, { recursive: true });
   const timeoutMs = config.jobTimeoutMinutes * 60_000;
 
+  if (url && !/^https?:\/\//i.test(url)) return { ok: false, message: 'The job link should start with https://' };
+  if (url) {
+    const confirmed = await confirmEmployerUrl(ctx, ws, { url, company, title, tmp, logs });
+    if (confirmed.fail) return { ...confirmed.fail, log: logs.join('\n') };
+    url = confirmed.url;
+  }
+
   if (!text.trim()) {
-    if (!/^https?:\/\//i.test(url)) return { ok: false, message: 'Give a job link or paste the job description.' };
+    if (!url) return { ok: false, message: 'Give a job link or paste the job description.' };
     const fetched = await runScript(config.careerOpsDir, 'fetch-jd.mjs', [url], { dataDir: ws.dir, uid: ws.uid, timeoutMs: 120_000 });
     logs.push(`$ node fetch-jd.mjs <url> (exit ${fetched.code})`);
     if (fetched.code === 3) {
@@ -96,9 +154,18 @@ export async function runScore(ctx, job, ws, user) {
 
   // Fold the new tracker row into data/applications.md (upstream's only write path for new rows).
   const merge = await runScript(config.careerOpsDir, 'merge-tracker.mjs', [], { dataDir: ws.dir, uid: ws.uid, timeoutMs: 120_000 });
-  logs.push(`$ node merge-tracker.mjs (exit ${merge.code})\n${tail(merge.stdout, 1500)}`);
-
+  logs.push(`$ node merge-tracker.mjs (exit ${merge.code})\n${tail(merge.stdout, 1500)}\n${tail(merge.stderr, 1500)}`);
   const parsed = parseEvalOutput(evalRun.stdout);
+  if (merge.code !== 0) {
+    // The report exists but the tracker row does not: say so instead of "Scored".
+    return {
+      ok: false,
+      message: `The report was written${parsed.report ? ` (${parsed.report})` : ''}, but adding it to your tracker failed. See the log.`,
+      result: { ...parsed, url: url || null, usage, trackerMerged: false },
+      log: logs.join('\n'),
+    };
+  }
+
   return {
     ok: true,
     message: parsed.score !== null ? `Scored ${parsed.score}/5.` : 'Scored.',

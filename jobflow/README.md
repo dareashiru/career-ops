@@ -130,3 +130,9 @@ per web host instance (6), `WEB_IDLE_MINUTES` (30), `SYNC_INTERVAL_SECONDS` (60)
 - A web host crash can lose up to one sync interval (60 s) of edits made in the
   web app. Bucket versioning keeps earlier copies.
 - Per-user uids isolate users on one instance; they are not a container per user.
+- A job-board link (LinkedIn, Indeed, Wellfound...) is never fetched. It is scored
+  only when upstream's `confirm-at-employer.mjs` finds the same title on the
+  employer's own board (or the posting is already the employer's); a near match
+  is shown to the user to check, not scored.
+- Files over 25 MB are not synced (the bucket keeps any earlier copy), and an
+  import is refused if it unpacks past 200 MB or 20,000 files.

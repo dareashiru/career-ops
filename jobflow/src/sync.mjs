@@ -57,7 +57,12 @@ export async function download(storage, prefix, userId, dir) {
   return manifest;
 }
 
-export async function scan(dir) {
+/**
+ * List the folder's files that sync. Files over MAX_FILE_BYTES are listed in
+ * `oversized`, not `files`: they are not uploaded, and upload() never takes
+ * their absence as a deletion.
+ */
+export async function scan(dir, oversized = new Set()) {
   const files = {};
   async function walk(current) {
     for (const e of await readdir(current, { withFileTypes: true })) {
@@ -67,7 +72,8 @@ export async function scan(dir) {
       const st = await lstat(full);
       if (st.isSymbolicLink()) continue; // never follow links out of the workspace
       if (st.isDirectory()) await walk(full);
-      else if (st.isFile() && st.size <= MAX_FILE_BYTES) files[rel] = full;
+      else if (st.isFile() && st.size > MAX_FILE_BYTES) oversized.add(rel);
+      else if (st.isFile()) files[rel] = full;
     }
   }
   await walk(dir);
@@ -78,8 +84,9 @@ export async function scan(dir) {
 export async function upload(storage, prefix, userId, dir, manifest) {
   const base = userPrefix(prefix, userId);
   const next = {};
-  const summary = { put: 0, deleted: 0 };
-  const files = await scan(dir);
+  const summary = { put: 0, deleted: 0, oversized: [] };
+  const oversized = new Set();
+  const files = await scan(dir, oversized);
   for (const [rel, full] of Object.entries(files)) {
     const body = await readFile(full);
     const h = hash(body);
@@ -88,6 +95,11 @@ export async function upload(storage, prefix, userId, dir, manifest) {
       await storage.put(base + rel, body);
       summary.put++;
     }
+  }
+  for (const rel of oversized) {
+    summary.oversized.push(rel);
+    // Still on disk, just too big to send: keep whatever the bucket has.
+    if (rel in manifest) next[rel] = manifest[rel];
   }
   for (const rel of Object.keys(manifest)) {
     if (!(rel in next)) {

@@ -97,6 +97,9 @@ export function dashboardPage({ user, jobs, usage, capMicro, hasOwnKey, flash })
 <div class="card"><h2>Score a job</h2>
 <form method="post" action="/jobflow/score">
 <label for="url">Job link</label><input id="url" name="url" type="url" placeholder="https://jobs.example.com/...">
+<p class="muted">Best is the employer's own link. For a LinkedIn or other job-board link, add the company and job title so JobFlow can find the role on the employer's site.</p>
+<label for="company">Company</label><input id="company" name="company" maxlength="200">
+<label for="title">Job title</label><input id="title" name="title" maxlength="300">
 <label for="text">Or paste the job description</label><textarea id="text" name="text"></textarea>
 <p><button type="submit">Score it</button></p></form>
 <p class="muted">Scoring reads your CV and profile, writes a report, and adds the job to your tracker as Evaluated. Nothing is ever submitted for you.</p></div>
@@ -130,6 +133,7 @@ export function jobPage({ user, job }) {
 <p>Status: ${statusCell(job)}</p>
 ${job.result?.score != null ? `<p>Score: <b>${esc(job.result.score)}/5</b>${job.result.report ? ` · report saved as <code>${esc(job.result.report)}</code>` : ''}</p>` : ''}
 ${job.result?.summary ? `<pre>${esc(job.result.summary)}</pre>` : ''}
+${Array.isArray(job.result?.near) && job.result.near.length ? `<p>Closest roles on the employer's site:</p><ul>${job.result.near.map((n) => `<li>${esc(n)}</li>`).join('')}</ul>` : ''}
 ${job.log ? `<details><summary>Log</summary><pre>${esc(job.log)}</pre></details>` : ''}</div>`,
   });
 }

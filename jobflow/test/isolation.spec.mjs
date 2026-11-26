@@ -5,6 +5,10 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:net';
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
+import * as tar from 'tar';
+import { createGzip } from 'node:zlib';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createApp } from '../src/app.mjs';
@@ -117,6 +121,51 @@ test("a user's edits are saved to their own folder in the bucket only", { skip: 
   await host.stop(a.id, 'test');
   const lock = await env.pool.query('SELECT 1 FROM workspace_locks WHERE user_id = $1', [a.id]);
   assert.equal(lock.rowCount, 0);
+});
+
+test('an export includes edits made in the open web app a moment ago', { skip: !hasDb }, async () => {
+  assert.equal((await req('/jobflow/open', { method: 'POST', cookie: cookieB })).status, 200);
+  assert.equal(await (await req('/write?name=fresh.md', { method: 'POST', cookie: cookieB, body: 'just typed' })).text(), 'written');
+  const res = await req('/jobflow/export', { cookie: cookieB });
+  assert.equal(res.status, 200);
+  const names = [];
+  const files = {};
+  await pipeline(Readable.from(Buffer.from(await res.arrayBuffer())), tar.t({
+    onReadEntry: (e) => { names.push(e.path); const c = []; e.on('data', (d) => c.push(d)); e.on('end', () => { files[e.path] = Buffer.concat(c).toString(); }); },
+  }));
+  assert.equal(files['career-ops/fresh.md'], 'just typed', names.join(', '));
+  assert.equal(names.some((n) => n.includes(a.id) || n.includes('A private')), false);
+});
+
+test('an archive that unpacks too large is refused before anything is written', { skip: !hasDb }, async () => {
+  // One 210 MB file of zeros: a few hundred KB once gzipped.
+  const size = 210 * 1024 * 1024;
+  const header = Buffer.alloc(512);
+  header.write('zeros.bin', 0);
+  header.write('0000644\0', 100); header.write('0000000\0', 108); header.write('0000000\0', 116);
+  header.write(`${size.toString(8).padStart(11, '0')}\0`, 124);
+  header.write('00000000000\0', 136);
+  header.write('        ', 148);
+  header.write('0', 156);
+  header.write('ustar\x0000', 257);
+  let sum = 0;
+  for (const byte of header) sum += byte;
+  header.write(`${sum.toString(8).padStart(6, '0')}\0 `, 148);
+  const gz = createGzip({ level: 9 });
+  const out = [];
+  gz.on('data', (c) => out.push(c));
+  const done = new Promise((r) => gz.on('end', r));
+  gz.write(header);
+  const block = Buffer.alloc(1024 * 1024);
+  for (let i = 0; i < size / block.length; i++) gz.write(block);
+  gz.end(Buffer.alloc(1024));
+  await done;
+  const bomb = Buffer.concat(out);
+  assert.ok(bomb.length < 1024 * 1024, `the gzip is small (${bomb.length} bytes)`);
+  const res = await req('/jobflow/import', { method: 'POST', cookie: cookieB, body: bomb, headers: { 'content-type': 'application/gzip' } });
+  assert.equal(res.status, 400);
+  assert.match((await res.json()).message, /unpacks to more than/);
+  await assert.rejects(env.storage.get(`workspaces/${b.id}/zeros.bin`));
 });
 
 test('admin pages are for admins only', { skip: !hasDb }, async () => {

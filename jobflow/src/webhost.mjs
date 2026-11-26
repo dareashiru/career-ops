@@ -215,6 +215,25 @@ export class WebHost {
       return;
     }
 
+    const syncPath = url.pathname.match(/^\/__jobflow\/sessions\/([0-9a-f-]{36})\/sync$/i);
+    if (syncPath && req.method === 'POST') {
+      // Upload the open copy now, so an export reads the latest files.
+      const s = this.sessions.get(syncPath[1]);
+      if (!s || s.closing) {
+        res.writeHead(204).end();
+        return;
+      }
+      try {
+        await s.ws.sync();
+        res.writeHead(204).end();
+      } catch (err) {
+        this.log(`sync for ${s.userId} failed: ${err.message}`);
+        if (err instanceof LockLostError) await this.stop(s.userId, 'lock lost');
+        res.writeHead(500, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'sync-failed' }));
+      }
+      return;
+    }
+
     const sessionPath = url.pathname.match(/^\/__jobflow\/sessions\/([0-9a-f-]{36})$/i);
     if (sessionPath) {
       const userId = sessionPath[1];

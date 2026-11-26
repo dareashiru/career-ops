@@ -1,17 +1,19 @@
 // Tests that need neither a database nor career-ops.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, readFile, writeFile, rm, symlink } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, writeFile, rm, symlink, truncate } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { decryptSecret, encryptSecret } from '../src/crypto.mjs';
 import { createStorage } from '../src/storage.mjs';
-import { download, upload } from '../src/sync.mjs';
+import { MAX_FILE_BYTES, download, upload } from '../src/sync.mjs';
 import { usageFromSse, usageOf } from '../src/meter-proxy.mjs';
-import { parseEvalOutput } from '../src/handlers.mjs';
+import { interpretConfirmation, parseEvalOutput } from '../src/handlers.mjs';
 import { withoutJobflowCookies, tokenMatches } from '../src/webhost.mjs';
-import { sameOrigin } from '../src/app.mjs';
+import { checkArchive, sameOrigin } from '../src/app.mjs';
+import { gzipSync } from 'node:zlib';
+import * as tar from 'tar';
 import { costMicroUsd } from '../src/usage.mjs';
 
 const KEY = Buffer.alloc(32, 9).toString('base64');
@@ -49,7 +51,7 @@ test('sync uploads only changes, mirrors deletes, and keeps users apart', async 
   await writeFile(join(dirA, 'cv.md'), '# A v2');
   await rm(join(dirA, 'data', 'applications.md'));
   ({ manifest, summary } = await upload(storage, 'workspaces/', USER_A, dirA, manifest));
-  assert.deepEqual(summary, { put: 1, deleted: 1 });
+  assert.deepEqual(summary, { put: 1, deleted: 1, oversized: [] });
 
   const dirB = join(base, 'b');
   const mB = await download(storage, 'workspaces/', USER_B, dirB);
@@ -59,6 +61,64 @@ test('sync uploads only changes, mirrors deletes, and keeps users apart', async 
   await download(storage, 'workspaces/', USER_A, again);
   assert.equal(await readFile(join(again, 'cv.md'), 'utf8'), '# A v2');
   assert.equal(existsSync(join(again, 'data', 'applications.md')), false);
+});
+
+test('a file that grows past the size limit keeps its bucket copy', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'jf-big-'));
+  const storage = createStorage({ driver: 'fs', fsRoot: join(base, 'bucket') });
+  const dir = join(base, 'w');
+  await mkdir(join(dir, 'output'), { recursive: true });
+  await writeFile(join(dir, 'output', 'cv.pdf'), 'small pdf');
+  let { manifest } = await upload(storage, 'workspaces/', USER_A, dir, {});
+  await truncate(join(dir, 'output', 'cv.pdf'), MAX_FILE_BYTES + 1);
+  await writeFile(join(dir, 'output', 'huge.bin'), '');
+  await truncate(join(dir, 'output', 'huge.bin'), MAX_FILE_BYTES + 1);
+  let summary;
+  ({ manifest, summary } = await upload(storage, 'workspaces/', USER_A, dir, manifest));
+  assert.equal(summary.deleted, 0, 'an oversized file is not a deletion');
+  assert.deepEqual(summary.oversized.sort(), ['output/cv.pdf', 'output/huge.bin']);
+  assert.ok('output/cv.pdf' in manifest);
+  const again = join(base, 'w2');
+  await download(storage, 'workspaces/', USER_A, again);
+  assert.equal(await readFile(join(again, 'output', 'cv.pdf'), 'utf8'), 'small pdf');
+  await rm(base, { recursive: true, force: true });
+});
+
+test('imports are refused when they unpack too large or hold too many files', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'jf-arc-'));
+  const src = join(base, 'career-ops');
+  await mkdir(join(src, 'data'), { recursive: true });
+  await writeFile(join(src, 'cv.md'), '# CV');
+  await writeFile(join(src, 'data', 'applications.md'), 'rows');
+  await writeFile(join(src, 'zeros.bin'), Buffer.alloc(2 * 1024 * 1024));
+  const make = async (cwd, entries) => {
+    const chunks = [];
+    for await (const c of tar.c({ gzip: true, cwd, portable: true }, entries)) chunks.push(c);
+    return Buffer.concat(chunks);
+  };
+  const parent = await make(base, ['career-ops']);
+  assert.equal(checkArchive(parent).strip, 1);
+  assert.equal(checkArchive(await make(src, ['cv.md', 'data'])).strip, 0);
+  // 2 MB of zeros gzips to a few KB: the limit is on what it unpacks to.
+  assert.ok(parent.length < 64 * 1024);
+  assert.throws(() => checkArchive(parent, { maxUnpackedBytes: 1024 * 1024, maxEntries: 100 }), /unpacks to more than/);
+  assert.throws(() => checkArchive(parent, { maxUnpackedBytes: 10 * 1024 * 1024, maxEntries: 2 }), /more than 2 files/);
+  assert.throws(() => checkArchive(gzipSync(Buffer.alloc(0)).subarray(0, 5)), /not a .tar.gz/);
+  await rm(base, { recursive: true, force: true });
+});
+
+test('job-board links are scored only once found at the employer', () => {
+  const run = (r) => ({ code: 0, stdout: JSON.stringify({ near: [], evidence: '', ...r }) });
+  assert.deepEqual(interpretConfirmation(run({ verdict: 'employer_url', employerUrl: 'https://jobs.ashbyhq.com/x/1', live: 'open' }), {}), { url: 'https://jobs.ashbyhq.com/x/1' });
+  assert.equal(interpretConfirmation(run({ verdict: 'employer_url', employerUrl: 'https://e/1', live: 'closed' }), {}).fail.result.closed, true);
+  assert.deepEqual(interpretConfirmation(run({ verdict: 'found', match: 'exact', employerUrl: 'https://e/2', live: 'unknown' }), {}), { url: 'https://e/2', confirmed: 'exact' });
+  const near = interpretConfirmation(run({ verdict: 'found', match: 'near', employerUrl: 'https://e/3' }), {});
+  assert.equal(near.fail.ok, false);
+  assert.match(near.fail.message, /https:\/\/e\/3/);
+  assert.match(interpretConfirmation(run({ verdict: 'unidentified' }), {}).fail.message, /company and job title/);
+  assert.match(interpretConfirmation(run({ verdict: 'board_without_role', near: [{ title: 'SRE', url: 'https://e/4' }] }), { company: 'Acme' }).fail.message, /Acme/);
+  assert.equal(interpretConfirmation(run({ verdict: 'no_board' }), { company: 'Acme' }).fail.ok, false);
+  assert.equal(interpretConfirmation({ code: 2, stdout: '' }, {}).fail.ok, false);
 });
 
 test('sync refuses bucket keys that would escape the workspace', async () => {

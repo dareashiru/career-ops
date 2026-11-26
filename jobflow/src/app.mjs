@@ -10,7 +10,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
-import { constants as zlibConstants, gunzipSync } from 'node:zlib';
+import { gunzipSync } from 'node:zlib';
 import * as tar from 'tar';
 import {
   clearSessionCookie, createInvite, createSession, destroySession, googleCallback, googleEnabled,
@@ -21,7 +21,7 @@ import { encryptSecret } from './crypto.mjs';
 import { enqueueJob, getJob, hasPendingJob, listJobs } from './jobs.mjs';
 import { capMicroUsd, monthStart, monthUsage } from './usage.mjs';
 import { currentLock } from './lock.mjs';
-import { download } from './sync.mjs';
+import { MAX_FILE_BYTES, download } from './sync.mjs';
 import { LockBusyError, openWorkspace } from './workspace.mjs';
 import { proxyRequest, proxyUpgrade } from './http-proxy.mjs';
 import { INTERNAL_HEADER, USER_HEADER, webHolderUrl } from './webhost.mjs';
@@ -103,6 +103,17 @@ export function createApp(ctx) {
     }).catch(() => {});
   }
 
+  /** Ask the web host holding this user's open web app to upload it now. */
+  async function syncWebApp(userId) {
+    const holder = await webHolderUrl(pool, userId);
+    if (!holder) return true;
+    const res = await fetchImpl(`${holder}/__jobflow/sessions/${userId}/sync`, {
+      method: 'POST',
+      headers: { [INTERNAL_HEADER]: config.internalToken },
+    }).catch(() => null);
+    return Boolean(res && res.status < 300);
+  }
+
   function forwardHeaders(user) {
     return {
       [INTERNAL_HEADER]: config.internalToken,
@@ -147,6 +158,10 @@ export function createApp(ctx) {
   }
 
   async function exportWorkspace(res, user) {
+    // The open web app uploads every minute; upload now so the export has the latest edits.
+    if (!(await syncWebApp(user.id))) {
+      return html(res, messagePage({ user, title: 'Try again', message: 'Your open workspace could not be saved just now, so the export would miss recent edits. Try again in a minute.' }), 503);
+    }
     const tmp = await mkdtemp(join(config.workDir, 'export-'));
     try {
       await download(storage, config.storage.prefix, user.id, join(tmp, 'career-ops'));
@@ -174,19 +189,28 @@ export function createApp(ctx) {
     }
     let count = 0;
     try {
+      const limits = checkArchive(body);
+      const tooBig = [];
       await pipeline(Readable.from(body), tar.x({
         cwd: ws.dir,
         // Accept an archive of the folder itself or of its parent (career-ops/...).
-        strip: detectStrip(body),
+        strip: limits.strip,
         // Regular files and folders only; no links, devices or paths outside the folder.
         filter: (path, entry) => {
           const ok = (entry.type === 'File' || entry.type === 'Directory') && !path.split('/').includes('..');
+          if (ok && entry.type === 'File' && entry.size > MAX_FILE_BYTES) {
+            tooBig.push(path);
+            return false;
+          }
           if (ok && entry.type === 'File') count++;
           return ok;
         },
         preserveOwner: false,
         noChmod: true,
       }));
+      if (tooBig.length) {
+        throw new Error(`files over ${MAX_FILE_BYTES / 1024 / 1024} MB are not accepted: ${tooBig.slice(0, 3).join(', ')}`);
+      }
       await ws.own(ws.dir);
       await ws.close();
     } catch (err) {
@@ -250,7 +274,13 @@ export function createApp(ctx) {
       if (!jobUrl && !text) return dashboard(req, res, user, 'Add a job link or paste the description.');
       if (jobUrl && !/^https?:\/\//i.test(jobUrl)) return dashboard(req, res, user, 'The job link should start with https://');
       const job = await enqueueJob(pool, {
-        userId: user.id, type: 'score', payload: { url: jobUrl || null, text: text.slice(0, 100_000) || null }, maxAttempts: 2,
+        userId: user.id, type: 'score', maxAttempts: 2,
+        payload: {
+          url: jobUrl || null,
+          company: (form.get('company') ?? '').trim().slice(0, 200) || null,
+          title: (form.get('title') ?? '').trim().slice(0, 300) || null,
+          text: text.slice(0, 100_000) || null,
+        },
       });
       return redirect(res, `/jobflow/jobs/${job.id}`);
     }
@@ -375,16 +405,43 @@ function sameOriginUpgrade(req, publicUrl) {
   return !req.headers.origin || req.headers.origin === new URL(publicUrl).origin;
 }
 
-/** 1 when every entry sits under one top folder (an archive of "career-ops/"), else 0. */
-export function detectStrip(gz) {
-  // Read the first entry's name from the tar header.
+// Limits for an imported archive, checked on the decompressed bytes before
+// anything is written: a 50 MB gzip can expand to many gigabytes.
+export const IMPORT_LIMITS = Object.freeze({ maxUnpackedBytes: 200 * 1024 * 1024, maxEntries: 20_000 });
+
+/**
+ * Decompress the archive once with a hard output cap, walk its tar headers and
+ * refuse it when it unpacks too large or holds too many entries. Returns the
+ * strip level: 1 when the entries sit under one top folder (an archive of
+ * "career-ops/"), else 0. Throws with a message the user can read.
+ */
+export function checkArchive(gz, limits = IMPORT_LIMITS) {
+  let raw;
   try {
-    const raw = gunzipSync(gz.subarray(0, Math.min(gz.length, 4 * 1024 * 1024)), { finishFlush: zlibConstants.Z_SYNC_FLUSH });
-    const first = raw.subarray(0, 100).toString('utf8').replace(/\0.*$/s, '');
-    const top = first.split('/')[0];
-    const known = ['cv.md', 'config', 'data', 'modes', 'reports', 'portals.yml', 'jds', 'output', 'interview-prep', '.', ''];
-    return top && !known.includes(top) && first.includes('/') ? 1 : 0;
-  } catch {
-    return 0;
+    // tar pads to 512-byte blocks and ends with two zero blocks; allow that slack.
+    raw = gunzipSync(gz, { maxOutputLength: limits.maxUnpackedBytes + 64 * 1024 });
+  } catch (err) {
+    if (err.code === 'ERR_BUFFER_TOO_LARGE' || /maxOutputLength|buffer.*large/i.test(err.message)) {
+      throw new Error(`it unpacks to more than ${limits.maxUnpackedBytes / 1024 / 1024} MB`);
+    }
+    throw new Error('it is not a .tar.gz file');
   }
+  let entries = 0;
+  let first = '';
+  for (let off = 0; off + 512 <= raw.length;) {
+    const header = raw.subarray(off, off + 512);
+    if (header.every((b) => b === 0)) break;
+    const name = header.subarray(0, 100).toString('utf8').replace(/\0.*$/s, '');
+    const size = parseInt(header.subarray(124, 136).toString('utf8').replace(/\0.*$/s, '').trim() || '0', 8) || 0;
+    const type = String.fromCharCode(header[156] || 48);
+    // PAX and GNU long-name headers describe the next entry; count real entries only.
+    if (!['x', 'g', 'L', 'K'].includes(type)) {
+      if (++entries > limits.maxEntries) throw new Error(`it holds more than ${limits.maxEntries} files`);
+      if (!first) first = name;
+    }
+    off += 512 + Math.ceil(size / 512) * 512;
+  }
+  const top = first.split('/')[0];
+  const known = ['cv.md', 'config', 'data', 'modes', 'reports', 'portals.yml', 'jds', 'output', 'interview-prep', '.', ''];
+  return { strip: top && !known.includes(top) && first.includes('/') ? 1 : 0, entries };
 }

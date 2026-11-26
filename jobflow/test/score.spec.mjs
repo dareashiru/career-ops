@@ -55,3 +55,22 @@ test('a pasted job is scored, reported and added to the tracker', async (t) => {
   assert.match(report, /Job Description \(archived verbatim\)/);
   assert.equal((await pool.query('SELECT 1 FROM workspace_locks WHERE user_id = $1', [user.id])).rowCount, 0, 'lock released');
 });
+
+test('a job-board link is not scored until the employer has the role', async (t) => {
+  if (!hasDb || !ready()) return t.skip('needs Postgres and `npm install` in the career-ops folder');
+  const { ctx, pool } = env;
+  const user = await makeUser(pool, 'board@example.com');
+  const calls = mock.calls.length;
+  // Even with the description pasted, a LinkedIn link with no employer to look for stops here.
+  await enqueueJob(pool, {
+    userId: user.id, type: 'score',
+    payload: { url: 'https://www.linkedin.com/jobs/view/1234567890/', text: 'Staff Engineer. Remote.' },
+  });
+  const job = await claimJob(pool, 'test-worker');
+  await executeJob(ctx, job);
+  const row = (await pool.query('SELECT status, result, log FROM jobs WHERE id = $1', [job.id])).rows[0];
+  assert.equal(row.status, 'failed', row.log);
+  assert.match(row.result.message, /job board/);
+  assert.match(row.log, /confirm-at-employer\.mjs \(exit 0\)/);
+  assert.equal(mock.calls.length, calls, 'no AI call was made');
+});

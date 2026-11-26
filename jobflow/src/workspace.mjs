@@ -112,6 +112,9 @@ export async function openWorkspace(ctx, userId, { kind, holder, holderUrl } = {
         }
         const res = await upload(storage, config.storage.prefix, userId, dir, manifest);
         manifest = res.manifest;
+        if (res.summary.oversized.length) {
+          log(`workspace ${userId}: not uploading ${res.summary.oversized.length} file(s) over the size limit`);
+        }
         return res.summary;
       });
       syncing = run;
